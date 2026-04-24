@@ -1,0 +1,43 @@
+# Build output
+/build
+/bin
+/assets/brickadia
+
+# Visual Studio
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.ncb
+*.opendb
+*.db
+*.db-shm
+*.db-wal
+ipch/
+x64/
+x86/
+Debug/
+Release/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+*.VC.db
+*.VC.opendb
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Claude
+.claude/

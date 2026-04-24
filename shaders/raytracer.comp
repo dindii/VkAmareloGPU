@@ -1,0 +1,486 @@
+#version 460
+
+layout (local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba16f,set = 0, binding = 0) uniform image2D image;
+
+#define MATERIAL_TYPE_LAMBERTIAN 0
+#define MATERIAL_TYPE_METAL 1
+#define MATERIAL_TYPE_DIELECTRIC 2
+
+struct Camera
+{
+	vec4 targetDir;
+	vec4 right;
+	vec4 up;
+	vec4 position;
+	vec4 yawPitch;
+
+    float fov;
+	float dofDist;
+	float dofBlur;
+	float _pad;
+};
+
+layout( push_constant ) uniform constants
+{
+ vec4 data1;
+ vec4 data2;
+ vec4 data3;
+ vec4 data4;
+ int currentFrame;
+} PushConstants;
+
+uint hash(uint seed) {
+    seed = (seed ^ 61u) ^ (seed >> 16u);
+    seed *= 9u;
+    seed = seed ^ (seed >> 4u);
+    seed *= 0x27D4EB2Du;
+    seed = seed ^ (seed >> 15u);
+    return seed;
+}
+
+layout(set = 0, binding = 2) uniform sampler2D RandUnitVecTex;
+
+uint frame;
+
+uint seed;
+
+const uint RAND_MAX =  4294967295 ;
+
+int g_SPP = 100;
+uint g_CurrentSampleIdx = 0;
+float g_SPP_Scale = 1.0f / g_SPP;
+int g_MaxBounces = 50;
+
+void randomInit() {
+    seed =
+        hash(hash(uint(gl_GlobalInvocationID.x) + hash(uint(gl_GlobalInvocationID.y))) + frame);
+}
+
+uint randomUint() {
+    seed = hash(seed);
+    return seed;
+}
+
+vec3 sampleRandomVectorWithOffset(uint offset)
+{
+    uint idx = (offset) & (2048u * 1024u - 1u); 
+    ivec2 texel = ivec2(idx & 2047u, idx >> 11u);
+    return texture(RandUnitVecTex, vec2(texel)).xyz;
+}
+
+float randomFloat() { return float(randomUint()) / float(RAND_MAX); }
+
+float randomFloat(float min, float max) {
+    return min + (max - min) * randomFloat();
+}
+
+vec3 sampleRandomVector()
+{
+    //scoped operations on the local registers were way more performatic than tex fetches.
+    float phi = randomFloat(0.0f, 6.28318f);
+    float cosTheta = randomFloat(-1.0f, 1.0f);
+    float sinTheta = sqrt(1.0f - cosTheta * cosTheta);
+    return vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+
+
+    //uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * 2048;
+    //uint scrambled = id ^ (id >> 4u) ^ (g_CurrentSampleIdx * 2654435761u);
+    //
+    //ivec2 texel = ivec2(scrambled % 2048, (scrambled / 2048) % 1024);
+    //return texture(RandUnitVecTex, vec2(texel)).xyz;
+}
+
+struct Ray
+{
+    vec3 Origin;
+    vec3 Direction;
+};
+
+struct Material
+{
+    vec4 Attenuation;
+    float Roughness;
+    float RefractionIdx;
+    int Type;
+    float _pad;
+};
+
+struct Sphere
+{
+    vec4 CenterRadius; 
+    int MaterialType;
+    float _p0;
+    float _p1;
+    float _p2;
+};
+
+//I will keep sphere/material data here due to high coalescing potential
+layout(set = 0, binding = 1) uniform UBO {
+    Camera camera;
+    Sphere spheres[32];
+    Material materials[3];
+    int spheresCount;
+} ubo[2];
+
+float g_AspectRatio = 16.0f / 9.0f;
+int g_ImageWidth = 2048;
+int g_ImageHeight = int(g_ImageWidth / g_AspectRatio);
+
+float g_DefocusAngle = ubo[PushConstants.currentFrame].camera.dofBlur;
+float g_DefocusDist = ubo[PushConstants.currentFrame].camera.dofDist;
+
+float fov = ubo[PushConstants.currentFrame].camera.fov;
+
+vec3 g_LookFrom = ubo[PushConstants.currentFrame].camera.position.xyz;
+vec3 g_LookAt = vec3(0.0f, 0.0f, -1.0f);
+vec3 g_VecUp = vec3(0.0f, 1.0f, 0.0f);
+
+
+float theta = radians(fov);
+float h = tan(theta/2.0f);
+
+float g_ViewportHeight = 2.0f * h * g_DefocusDist;
+
+float g_ViewportWidth = g_ViewportHeight * (float(g_ImageWidth) / g_ImageHeight);
+vec3 g_CameraCenter = g_LookFrom;
+
+float yaw = PushConstants.data3.x;
+float pitch = PushConstants.data3.y;
+vec3 dir = ubo[PushConstants.currentFrame].camera.targetDir.xyz;
+
+vec3 w = normalize(dir);
+vec3 u = normalize(ubo[PushConstants.currentFrame].camera.right.xyz);
+vec3 v = normalize(ubo[PushConstants.currentFrame].camera.up.xyz);
+
+
+vec3 g_viewportU = g_ViewportWidth * u;
+vec3 g_viewportV = g_ViewportHeight * -v;
+
+vec3 g_PixelDeltaU = g_viewportU / g_ImageWidth;
+vec3 g_PixelDeltaV = g_viewportV / g_ImageHeight;
+
+vec3 g_ViewportBegin = g_CameraCenter - (g_DefocusDist * w) - g_viewportU / 2.0f - g_viewportV / 2.0f;
+vec3 g_FirstPixelLocation = g_ViewportBegin + 0.5f * (g_PixelDeltaU + g_PixelDeltaV);
+
+float g_DefocusRadius = g_DefocusDist * tan(radians(g_DefocusAngle / 2.0f));
+
+vec3 g_DefocusDiskU = u * g_DefocusRadius; 
+vec3 g_DefocusDiskV = v * g_DefocusRadius;
+
+float g_IntervalMin = 0.001f;
+float g_IntervalMax = 10000.0f;
+
+
+/*
+    To move to Uniform Buffer stuff
+*/
+
+
+vec3 RayAt(Ray ray, float t)
+{
+    return ray.Origin + t * ray.Direction;
+}
+
+struct HitDetails
+{
+    vec3 Normal;
+    vec3 HitLocation;
+    bool FrontFace;
+    float t;
+    int MaterialType;
+    bool Hit;
+};
+
+bool IntervalContains(float t, float intervalMin, float intervalMax)
+{
+    return ( intervalMin <= t && t <= intervalMax);
+}
+
+bool IntervalSurrounds(float t, float intervalMin, float intervalMax)
+{
+    return ( intervalMin < t && t < intervalMax);
+}
+
+bool RayHitSphere(Ray ray, Sphere sphere, out HitDetails details)
+{
+    float t = dot(vec3(sphere.CenterRadius.xyz) - ray.Origin, ray.Direction);
+    vec3 point = ray.Origin + ray.Direction * t;
+    float height = length(vec3(sphere.CenterRadius.xyz) - point);
+
+    if(height < sphere.CenterRadius.w)
+    {
+        float x = sqrt(pow(sphere.CenterRadius.w, 2) - pow(height, 2));
+        float t1 = t - x;
+        float t2 = t + x; 
+        
+        if(IntervalSurrounds(t1, g_IntervalMin, g_IntervalMax))
+        {
+            details.t = t1;
+        }
+        else if(IntervalSurrounds(t2, g_IntervalMin, g_IntervalMax))
+        {
+            details.t = t2;
+        }
+        else
+        {
+            return false;
+        }
+        
+        details.HitLocation = RayAt(ray, details.t);
+     //   details.Normal = (details.HitLocation - sphere.Center) / sphere.Radius;
+        details.Normal = normalize(details.HitLocation - vec3(sphere.CenterRadius.xyz));
+        details.FrontFace = true;
+
+        if(dot(ray.Direction, details.Normal) > 0.0f)
+        {
+            details.FrontFace = false;
+            details.Normal = normalize(vec3(-details.Normal.x, -details.Normal.y, -details.Normal.z));
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+HitDetails FindClosestHit(Ray ray)
+{
+    HitDetails closest;
+    closest.Hit = false;
+    closest.t = g_IntervalMax;
+
+    for(int i = 0; i < ubo[PushConstants.currentFrame].spheresCount; i++)
+    {
+        HitDetails currentHit;
+        if(RayHitSphere(ray, ubo[PushConstants.currentFrame].spheres[i], currentHit))
+        {
+            if(closest.t > currentHit.t)
+            {
+                closest = currentHit;
+                closest.MaterialType = ubo[PushConstants.currentFrame].spheres[i].MaterialType;
+                closest.Hit = true;
+            }
+        }
+    }
+
+    return closest;
+}
+
+float Hash(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352d;
+    x ^= x >> 15;
+    x *= 0x846ca68b;
+    x ^= x >> 16;
+    return float(x) / float(0xffffffffu);
+}
+
+vec3 RandomVec3(uvec3 id, uint seed)
+{
+    uint h1 = id.x + seed;
+    uint h2 = id.y + seed * 1664525u;
+    uint h3 = id.z + seed * 1013904223u;
+    return vec3(Hash(h1), Hash(h2), Hash(h3));
+}
+
+vec3 SampleSquare(uint seedSeq) 
+{
+    uint seed = gl_GlobalInvocationID.x ^ (gl_GlobalInvocationID.y << 10) ^ (gl_GlobalInvocationID.z << 20);
+    seed += seedSeq;
+
+    vec3 randomVec = RandomVec3(gl_GlobalInvocationID, seed);
+
+   return vec3(randomVec.x - 0.5f, randomVec.y - 0.5f, 0.0f);
+}
+
+vec3 RandomOnDisk()
+{
+    vec3 random = sampleRandomVector();
+    random.z = 0.0f;
+    return random;
+}
+
+vec3 RandomOnDiskWithOffset(uint offset)
+{
+    vec3 random = sampleRandomVectorWithOffset(offset);
+    random.z = 0.0f;
+    return random;
+}
+
+vec3 SampleDisk()
+{
+    vec3 randomSample = RandomOnDisk();
+    return g_CameraCenter + (randomSample.x * g_DefocusDiskU) + (randomSample.y * g_DefocusDiskV);
+}
+
+vec3 SampleDiskWithOffset(uint offset)
+{
+    vec3 randomSample = RandomOnDiskWithOffset(offset);
+    return g_CameraCenter + (randomSample.x * g_DefocusDiskU) + (randomSample.y * g_DefocusDiskV);
+}
+
+
+vec3 GetDefaultColor(Ray ray)
+{
+    vec3 dirNorm = normalize(ray.Direction);
+    float alpha = 0.5f * (dirNorm.y + 1.0f);
+    return (1.0f - alpha) * vec3(1.0f, 1.0f, 1.0f) + alpha * vec3(0.5f, 0.7f, 1.0f);
+}
+
+vec3 ScatterMetalicBounce(vec3 inDir, vec3 normal, float roughnessFactor, out vec3 biasDirection, uint offsetBase)
+{
+    vec3 dir = normalize(reflect(inDir, normal)) + (roughnessFactor * sampleRandomVectorWithOffset(offsetBase));
+    biasDirection = normal;
+    return dir;
+}
+
+vec3 ScatterMetalic(vec3 inDir, vec3 normal, float roughnessFactor, out vec3 biasDirection)
+{
+    vec3 dir = normalize(reflect(inDir, normal)) + (roughnessFactor * sampleRandomVector());
+    biasDirection = normal;
+
+        //sometimes  sampleRandomVector(); will generate a vector almost opposite as the normal, in that case, the sum will be almost zero
+    //and that would lead us to visual glitches, we check that with a "near zero" check
+  
+    float epsilon = 1e-8;
+    (abs(dir.x) < epsilon && abs(dir.y) < epsilon && abs(dir.z) < epsilon) ? dir = biasDirection : dir = dir;
+    dir = normalize(dir);
+    return dir;
+}
+
+vec3 ScatterLambertian(vec3 normal, out vec3 biasDirection)
+{
+    vec3 dir = normal + sampleRandomVector();
+    biasDirection = normal;
+
+        //sometimes  sampleRandomVector(); will generate a vector almost opposite as the normal, in that case, the sum will be almost zero
+    //and that would lead us to visual glitches, we check that with a "near zero" check
+    float epsilon = 1e-8;
+    (abs(dir.x) < epsilon && abs(dir.y) < epsilon && abs(dir.z) < epsilon) ? dir = biasDirection : dir = dir;
+    dir = normalize(dir);
+
+    return dir;
+}
+
+float Reflectance(float cosine, float ri)
+{
+    float r0 = (1.0f - ri) / (1 + ri);
+    r0 = r0 * r0;
+
+    return r0 + (1.0f - r0) * pow((1 - cosine), 5);
+}
+
+vec3 ScatterDieletric(vec3 inDir, HitDetails hit, float idx, out vec3 biasDirection)
+{
+    float ri = hit.FrontFace ? (1.0f / idx) : idx;
+    vec3 dir = normalize(inDir);
+    
+    float cosTheta = min(dot(-dir, hit.Normal), 1.0f);
+    float sinTheta = sqrt(1.0f - cosTheta*cosTheta);
+
+    vec3 scatteredDir;
+
+    if(ri * sinTheta > 1.0f || Reflectance(cosTheta, ri) > randomFloat())
+    {
+       biasDirection = hit.Normal;
+       scatteredDir = vec3(reflect(inDir, hit.Normal));
+    }
+    else
+    {
+        biasDirection = inDir;
+        scatteredDir = vec3(refract(inDir, hit.Normal, ri));
+    }
+
+    float epsilon = 1e-8;
+    (abs(scatteredDir.x) < epsilon && abs(scatteredDir.y) < epsilon && abs(scatteredDir.z) < epsilon) ? scatteredDir = biasDirection : scatteredDir = scatteredDir;
+
+    return scatteredDir;
+}
+
+vec3 Scatter(Ray ray, HitDetails hit, out vec3 bias)
+{
+    Material mat = ubo[PushConstants.currentFrame].materials[hit.MaterialType];
+
+    if(mat.Type == MATERIAL_TYPE_LAMBERTIAN)
+    {
+        return ScatterLambertian(hit.Normal, bias);
+    }
+    else if(mat.Type == MATERIAL_TYPE_METAL)
+    {
+        return ScatterMetalic(ray.Direction, hit.Normal, mat.Roughness, bias);
+    }
+    else
+    {
+        return ScatterDieletric(ray.Direction, hit, mat.RefractionIdx, bias);
+    }
+}
+
+vec3 ResolveColorFromRay(Ray ray)
+{
+    Ray current = ray;
+    vec3 outColor = vec3(1.0f, 1.0f, 1.0f);
+
+    for(int i = 0; i < g_MaxBounces; i++)
+    {
+
+        if(max(outColor.r, max(outColor.g, outColor.b)) < 0.001f)
+        {
+            return outColor;
+        }
+
+        HitDetails hit = FindClosestHit(current);
+
+        if(!hit.Hit)
+        {
+            return outColor *= GetDefaultColor(current);
+        }
+
+        outColor *= ubo[PushConstants.currentFrame].materials[hit.MaterialType].Attenuation.rgb;
+        
+        vec3 bias;
+        
+        current.Direction = normalize(Scatter(current, hit, bias));
+        current.Origin = hit.HitLocation + bias * 0.0001f;
+    }
+
+    return outColor;
+}
+
+void main() 
+{
+
+        ivec2 texelCoord = ivec2(gl_GlobalInvocationID.xy);
+        vec2 texelCoord2 = vec2(gl_GlobalInvocationID.x / 2048.0f, gl_GlobalInvocationID.y / 1024.0f);
+        
+	    ivec2 size = imageSize(image);
+        frame = 0;
+        randomInit();
+
+
+    if(texelCoord.x < size.x && texelCoord.y < size.y)
+    {
+            vec3 color = vec3(0.0, 0.0, 0.0);       
+            
+             uint baseOffset = randomUint() & 2097151u;
+
+            for(int i = 0; i < g_SPP; i++)
+            {
+                vec3 randomVec = (SampleSquare(i));
+                vec3 rayOrg = (g_DefocusAngle <= 0 ? g_CameraCenter : SampleDisk());
+                vec3 pixelCenter = g_FirstPixelLocation + ((texelCoord.x + randomVec.x) * g_PixelDeltaU) + ((texelCoord.y + randomVec.y) * g_PixelDeltaV);
+                vec3 rayDir = normalize(pixelCenter - rayOrg);
+                
+                Ray ray = Ray(rayOrg, rayDir);
+                color += ResolveColorFromRay(ray);
+                g_CurrentSampleIdx = i;
+            }
+
+        color *=  g_SPP_Scale;
+        vec4 finalColor = vec4(color, 1.0f);
+        finalColor = pow(finalColor, vec4(1.0f / 2.2f));
+
+        imageStore(image, texelCoord, finalColor);
+    }
+}
