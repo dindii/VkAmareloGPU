@@ -39,5 +39,5 @@ compile_commands.json
 CTestTestfile.cmake
 _deps/
 
-# Claude
+# Claude (Used to translate CMake into Premake so I could avoid doing that boring work manually)
 .claude/
